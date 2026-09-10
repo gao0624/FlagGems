@@ -69,6 +69,26 @@ def _get_active_index_add_module():
     return module
 
 
+def _uses_mthreads_bf16_receiver_owned_path(inp, dim, index, src):
+    if flag_gems.vendor_name != "mthreads" or inp.dtype != torch.bfloat16:
+        return True
+    module = _get_active_index_add_module()
+    if index.numel() == 0:
+        return False
+    touched_count = torch.unique(index).numel()
+    if module._can_use_bf16_grouped_path(inp, dim, index, src):
+        return (
+            touched_count == 1
+            or touched_count == index.numel()
+            or index.numel() >= touched_count * module._GROUPED_REUSE_THRESHOLD
+        )
+    if touched_count == 1 and module._can_use_bf16_all_same_path(inp, dim, index, src):
+        return True
+    return touched_count == index.numel() and module._can_use_bf16_unique_path(
+        inp, dim, index, src
+    )
+
+
 _INDEX_ADD_FIX_IS_ACTIVE = (
     flag_gems.index_add.__module__ == "flag_gems.ops.index_add"
     or flag_gems.vendor_name in ("metax", "mthreads")
@@ -491,8 +511,9 @@ def test_index_add_contiguous_suffix_randomized(shape, dim, dup_factor, inplace)
         ref_out = torch.index_add(ref_inp, dim, ref_index, ref_src, alpha=alpha)
 
     # High-precision reference models accumulate then cast once, which is the
-    # contract of the optimized bf16 fallback. Per-add bf16 rounding would
-    # fail this check at dup_factor=32.
+    # contract of the optimized MThreads bf16 receiver-owned paths. Smaller
+    # MThreads workloads intentionally fall back to native index_add for Torch
+    # parity and to avoid fixed grouping overhead.
     exact_inp = utils.to_reference(inp, upcast=True)
     exact_src = utils.to_reference(src, upcast=True)
     exact_out = torch.index_add(exact_inp, dim, ref_index, exact_src, alpha=alpha)
@@ -500,7 +521,8 @@ def test_index_add_contiguous_suffix_randomized(shape, dim, dup_factor, inplace)
     result = _run_flag_gems_index_add(inp, dim, index, src, inplace, alpha=alpha)
 
     target = ref_inp if inplace else ref_out
-    utils.gems_assert_close(result, exact_out, dtype=dtype, reduce_dim=1, atol=0.05)
+    if _uses_mthreads_bf16_receiver_owned_path(inp, dim, index, src):
+        utils.gems_assert_close(result, exact_out, dtype=dtype, reduce_dim=1, atol=0.05)
     utils.gems_assert_close(result, target, dtype=dtype, reduce_dim=1, atol=0.5)
 
 
