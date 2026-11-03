@@ -58,7 +58,7 @@ wrappers:
      transactions the fused kernel suffers on m-contiguous layouts;
   3. contiguous narrow-M (32..256 columns) fp32-class deep-K bands
      (>= 256 MiB) go to a column-strip streaming kernel
-     (``_mthreads_boolean_colstrip_*``): each CTA owns a contiguous row
+     (``_boolean_colstrip_kernel``): each CTA owns a contiguous row
      band cut so every (INNER, 32) tile load is fully unmasked with the
      warp's 32 lanes on 32 consecutive columns (128-byte requests), and
      the columns decompose into exact 32-wide chunks plus an exact
@@ -599,158 +599,120 @@ def _segcol_impl(inp, plan, is_all, seg_plan):
 # Correctness invariants:
 # - the band plan guarantees bands * RPC == ROWS and RPC % INNER == 0, so
 #   unmasked loads never leave the tensor (no masked-lane row overshoot and
-#   no cross-band reads: AND/OR over rows is idempotent, but band-local
-#   reads keep partials independent of the merge order anyway);
+#   no cross-band reads);
 # - the tail chunk is loaded unmasked only when its width covers exactly the
 #   remaining columns (tail_w == M - nfull * 32); otherwise it is masked
 #   (mask varies along the contiguous axis but only on the one small tile);
 # - int32 addressing is gated by an IDX64 constexpr (row * M products are
 #   widened before the multiply when numel crosses the int31 headroom).
+#
+# The kernel is a static @triton.jit function (no generated source): the
+# per-chunk blocks are constexpr-guarded, so one source covers the whole
+# 32..256 column range at the same specialization count a per-shape
+# generator would produce (equal TTGIR layouts / latency measured on
+# [100, 65536, 100] fp32).
 # ---------------------------------------------------------------------------
-def _generate_colstrip_kernel_source(nfull, tail_w, tail_exact):
-    kernel_name = (
-        f"_mthreads_boolean_colstrip_f{nfull}"
-        + (f"_t{tail_w}" if tail_w else "")
-        + ("" if tail_exact or not tail_w else "_m")
-    )
-    code = IndentedBuffer()
-    code.writeline("import triton")
-    code.writeline("import triton.language as tl")
-    code.newline()
-    code.writeline("@triton.jit")
-    code.writeline(f"def {kernel_name}(")
-    with code.indent():
-        code.writeline("inp,")
-        code.writeline("partial,")
-        code.writeline("M,")
-        code.writeline("BANDS,")
-        code.writeline("RPC,")
-        code.writeline("INNER: tl.constexpr,")
-        code.writeline("IS_ALL: tl.constexpr,")
-        code.writeline("IDX64: tl.constexpr,")
-    code.writeline("):")
-    with code.indent():
-        code.writeline("pid = tl.program_id(0)")
-        code.writeline("r_base = pid * RPC")
-        # per-chunk column accumulators (kept in registers)
-        for c in range(nfull):
-            if c == 0:
-                code.writeline("if IS_ALL:")
-                with code.indent():
-                    code.writeline(f"acc{c} = tl.full((32,), 1, tl.int1)")
-                code.writeline("else:")
-                with code.indent():
-                    code.writeline(f"acc{c} = tl.zeros((32,), dtype=tl.int1)")
+@libentry()
+@triton.jit
+def _boolean_colstrip_kernel(
+    inp,
+    partial,
+    M,
+    BANDS,
+    RPC,
+    INNER: tl.constexpr,
+    NCHUNK: tl.constexpr,
+    TAIL_W: tl.constexpr,
+    TAIL_EXACT: tl.constexpr,
+    IDX64: tl.constexpr,
+):
+    # Each CTA owns a contiguous row band and reduces it column-striped:
+    # every load is a fully unmasked (INNER, 32) tile whose 32 column lanes
+    # are contiguous addresses (128-byte warp requests on 4-byte elements),
+    # and the columns above NCHUNK * 32 are covered by one optional tail
+    # chunk (loaded unmasked only when it exactly covers the remaining
+    # columns). NCHUNK / TAIL_W / TAIL_EXACT are constexpr, so the per-chunk
+    # blocks below are pruned at compile time: one static source covers the
+    # whole 32..256 column range with the same specialization count as a
+    # per-shape generated kernel (measured identical TTGIR layouts and
+    # latency on [100, 65536, 100] fp32).
+    pid = tl.program_id(0)
+    r_base = pid * RPC
+    acc0 = tl.full((32,), 1, tl.int1)
+    if NCHUNK > 1:
+        acc1 = tl.full((32,), 1, tl.int1)
+    if NCHUNK > 2:
+        acc2 = tl.full((32,), 1, tl.int1)
+    if NCHUNK > 3:
+        acc3 = tl.full((32,), 1, tl.int1)
+    if NCHUNK > 4:
+        acc4 = tl.full((32,), 1, tl.int1)
+    if NCHUNK > 5:
+        acc5 = tl.full((32,), 1, tl.int1)
+    if NCHUNK > 6:
+        acc6 = tl.full((32,), 1, tl.int1)
+    if NCHUNK > 7:
+        acc7 = tl.full((32,), 1, tl.int1)
+    if TAIL_W > 0:
+        acct = tl.full((TAIL_W,), 1, tl.int1)
+    for r in range(0, RPC, INNER):
+        if IDX64:
+            rows = (r_base + r + tl.arange(0, INNER)).to(tl.int64)
+        else:
+            rows = r_base + r + tl.arange(0, INNER)
+        p = inp + rows[:, None] * M
+        v0 = tl.load(p + 0 + tl.arange(0, 32)[None, :])
+        acc0 = acc0 & (tl.min(v0 != 0, axis=0) == 1)
+        if NCHUNK > 1:
+            v1 = tl.load(p + 32 + tl.arange(0, 32)[None, :])
+            acc1 = acc1 & (tl.min(v1 != 0, axis=0) == 1)
+        if NCHUNK > 2:
+            v2 = tl.load(p + 64 + tl.arange(0, 32)[None, :])
+            acc2 = acc2 & (tl.min(v2 != 0, axis=0) == 1)
+        if NCHUNK > 3:
+            v3 = tl.load(p + 96 + tl.arange(0, 32)[None, :])
+            acc3 = acc3 & (tl.min(v3 != 0, axis=0) == 1)
+        if NCHUNK > 4:
+            v4 = tl.load(p + 128 + tl.arange(0, 32)[None, :])
+            acc4 = acc4 & (tl.min(v4 != 0, axis=0) == 1)
+        if NCHUNK > 5:
+            v5 = tl.load(p + 160 + tl.arange(0, 32)[None, :])
+            acc5 = acc5 & (tl.min(v5 != 0, axis=0) == 1)
+        if NCHUNK > 6:
+            v6 = tl.load(p + 192 + tl.arange(0, 32)[None, :])
+            acc6 = acc6 & (tl.min(v6 != 0, axis=0) == 1)
+        if NCHUNK > 7:
+            v7 = tl.load(p + 224 + tl.arange(0, 32)[None, :])
+            acc7 = acc7 & (tl.min(v7 != 0, axis=0) == 1)
+        if TAIL_W > 0:
+            ct = NCHUNK * 32 + tl.arange(0, TAIL_W)
+            if TAIL_EXACT:
+                vt = tl.load(p + ct[None, :])
             else:
-                code.writeline("if IS_ALL:")
-                with code.indent():
-                    code.writeline(f"acc{c} = tl.full((32,), 1, tl.int1)")
-                code.writeline("else:")
-                with code.indent():
-                    code.writeline(f"acc{c} = tl.zeros((32,), dtype=tl.int1)")
-        if tail_w:
-            code.writeline("if IS_ALL:")
-            with code.indent():
-                code.writeline(f"acct = tl.full(({tail_w},), 1, tl.int1)")
-            code.writeline("else:")
-            with code.indent():
-                code.writeline(f"acct = tl.zeros(({tail_w},), dtype=tl.int1)")
-        code.writeline("for r in range(0, RPC, INNER):")
-        with code.indent():
-            code.writeline("if IDX64:")
-            with code.indent():
-                code.writeline("rows = (r_base + r + tl.arange(0, INNER)).to(tl.int64)")
-            code.writeline("else:")
-            with code.indent():
-                code.writeline("rows = r_base + r + tl.arange(0, INNER)")
-            code.writeline("p = inp + rows[:, None] * M")
-            for c in range(nfull):
-                off = c * 32
-                code.writeline(f"v{c} = tl.load(p + {off} + tl.arange(0, 32)[None, :])")
-                if c == 0:
-                    code.writeline("if IS_ALL:")
-                    with code.indent():
-                        code.writeline(
-                            f"acc{c} = acc{c} & (tl.min(v{c} != 0, axis=0) == 1)"
-                        )
-                    code.writeline("else:")
-                    with code.indent():
-                        code.writeline(
-                            f"acc{c} = acc{c} | (tl.max(v{c} != 0, axis=0) == 1)"
-                        )
-                else:
-                    code.writeline("if IS_ALL:")
-                    with code.indent():
-                        code.writeline(
-                            f"acc{c} = acc{c} & (tl.min(v{c} != 0, axis=0) == 1)"
-                        )
-                    code.writeline("else:")
-                    with code.indent():
-                        code.writeline(
-                            f"acc{c} = acc{c} | (tl.max(v{c} != 0, axis=0) == 1)"
-                        )
-            if tail_w:
-                off = nfull * 32
-                if tail_exact:
-                    code.writeline(
-                        f"vt = tl.load(p + {off} + tl.arange(0, {tail_w})[None, :])"
-                    )
-                else:
-                    code.writeline(f"ct = {off} + tl.arange(0, {tail_w})")
-                    code.writeline(
-                        "vt = tl.load("
-                        "p + ct[None, :], mask=(ct < M)[None, :], "
-                        "other=1.0 if IS_ALL else 0.0)"
-                    )
-                code.writeline("if IS_ALL:")
-                with code.indent():
-                    code.writeline("acct = acct & (tl.min(vt != 0, axis=0) == 1)")
-                code.writeline("else:")
-                with code.indent():
-                    code.writeline("acct = acct | (tl.max(vt != 0, axis=0) == 1)")
-        # column-major partial stores: partial[col, band]
-        for c in range(nfull):
-            code.writeline(
-                f"tl.store(partial + ({c * 32} + tl.arange(0, 32)) * BANDS"
-                f" + pid, acc{c})"
-            )
-        if tail_w:
-            if tail_exact:
-                code.writeline(
-                    f"tl.store(partial + ({nfull * 32} + tl.arange(0, {tail_w}))"
-                    f" * BANDS + pid, acct)"
-                )
-            else:
-                code.writeline(f"ct = {nfull * 32} + tl.arange(0, {tail_w})")
-                code.writeline(
-                    "tl.store(partial + ct * BANDS + pid, acct, mask=ct < M)"
-                )
-    return kernel_name, code.getvalue()
-
-
-def _colstrip_kernel_for(nfull, tail_w, tail_exact):
-    key = (nfull, tail_w, tail_exact)
-    cache = getattr(_colstrip_kernel_for, "overloads", None)
-    if cache is None:
-        cache = {}
-        _colstrip_kernel_for.overloads = cache
-    if key in cache:
-        return cache[key]
-
-    kernel_name, source = _generate_colstrip_kernel_source(*key)
-    file_name = f"{kernel_name}.py"
-    file_path = code_cache_dir() / file_name
-    write_atomic(file_path, source)
-
-    spec = importlib.util.spec_from_file_location(
-        f"_mthreads_boolean_colstrip_gen_{kernel_name}", file_path
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    kernel = libentry()(getattr(module, kernel_name))
-    cache[key] = kernel
-    return kernel
+                vt = tl.load(p + ct[None, :], mask=(ct < M)[None, :], other=1.0)
+            acct = acct & (tl.min(vt != 0, axis=0) == 1)
+    # column-major partial stores: partial[col, band]
+    tl.store(partial + (0 + tl.arange(0, 32)) * BANDS + pid, acc0)
+    if NCHUNK > 1:
+        tl.store(partial + (32 + tl.arange(0, 32)) * BANDS + pid, acc1)
+    if NCHUNK > 2:
+        tl.store(partial + (64 + tl.arange(0, 32)) * BANDS + pid, acc2)
+    if NCHUNK > 3:
+        tl.store(partial + (96 + tl.arange(0, 32)) * BANDS + pid, acc3)
+    if NCHUNK > 4:
+        tl.store(partial + (128 + tl.arange(0, 32)) * BANDS + pid, acc4)
+    if NCHUNK > 5:
+        tl.store(partial + (160 + tl.arange(0, 32)) * BANDS + pid, acc5)
+    if NCHUNK > 6:
+        tl.store(partial + (192 + tl.arange(0, 32)) * BANDS + pid, acc6)
+    if NCHUNK > 7:
+        tl.store(partial + (224 + tl.arange(0, 32)) * BANDS + pid, acc7)
+    if TAIL_W > 0:
+        ct = NCHUNK * 32 + tl.arange(0, TAIL_W)
+        if TAIL_EXACT:
+            tl.store(partial + ct * BANDS + pid, acct)
+        else:
+            tl.store(partial + ct * BANDS + pid, acct, mask=ct < M)
 
 
 @libentry()
@@ -760,36 +722,26 @@ def _boolean_colstrip_merge_kernel(
     out,
     M,
     BANDS,
-    IS_ALL: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_S: tl.constexpr,
 ):
     # partial is column-major [M, BANDS]: each m row is BANDS contiguous
-    # bytes, so the merge reads fully coalesced 1D runs.
+    # bytes, so the merge reads fully coalesced 1D runs. The colstrip route
+    # is all-only, so the merge is a plain AND (out-of-range reads are
+    # neutral 1s).
     pid = tl.program_id(0)
     m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
     m_mask = m < M
-    if IS_ALL:
-        acc = tl.full((BLOCK_M,), 1, tl.int1)
-    else:
-        acc = tl.zeros((BLOCK_M,), dtype=tl.int1)
+    acc = tl.full((BLOCK_M,), 1, tl.int1)
     for s0 in range(0, BANDS, BLOCK_S):
         s = s0 + tl.arange(0, BLOCK_S)
         s_mask = s < BANDS
-        if IS_ALL:
-            v = tl.load(
-                partial + m[:, None] * BANDS + s[None, :],
-                mask=m_mask[:, None] & s_mask[None, :],
-                other=1,
-            )
-            acc = acc & tl.min(v != 0, axis=1).to(tl.int1)
-        else:
-            v = tl.load(
-                partial + m[:, None] * BANDS + s[None, :],
-                mask=m_mask[:, None] & s_mask[None, :],
-                other=0,
-            )
-            acc = acc | tl.max(v != 0, axis=1).to(tl.int1)
+        v = tl.load(
+            partial + m[:, None] * BANDS + s[None, :],
+            mask=m_mask[:, None] & s_mask[None, :],
+            other=1,
+        )
+        acc = acc & tl.min(v != 0, axis=1).to(tl.int1)
     tl.store(out + m, acc, mask=m_mask)
 
 
@@ -864,11 +816,7 @@ def _plan_colstrip(inp, reduce_dims, is_all):
                     "nfull": nfull,
                     "tail_w": tail_w,
                     "tail_exact": tail_exact,
-                    "idx64": (
-                        _FORCE_IDX64
-                        or inp.numel() >= _IDX32_LIMIT
-                        or rows * m_cols >= _IDX32_LIMIT
-                    ),
+                    "idx64": _FORCE_IDX64 or inp.numel() >= _IDX32_LIMIT,
                 }
     if len(_COLSTRIP_PLAN_CACHE) < 4096:
         _COLSTRIP_PLAN_CACHE[key] = plan
@@ -880,19 +828,18 @@ def _colstrip_impl(inp, plan, is_all, cs_plan):
     out_dtype = torch.uint8 if inp.dtype == torch.uint8 else torch.bool
     M = cs_plan["M"]
     bands = cs_plan["bands"]
-    kernel = _colstrip_kernel_for(
-        cs_plan["nfull"], cs_plan["tail_w"], cs_plan["tail_exact"]
-    )
     with torch_device_fn.device(inp.device):
         partial = torch.empty((M, bands), dtype=torch.int8, device=inp.device)
-        kernel[(bands,)](
+        _boolean_colstrip_kernel[(bands,)](
             inp,
             partial,
             M,
             bands,
             cs_plan["RPC"],
             INNER=_COLSTRIP_INNER,
-            IS_ALL=is_all,
+            NCHUNK=cs_plan["nfull"],
+            TAIL_W=cs_plan["tail_w"],
+            TAIL_EXACT=cs_plan["tail_exact"],
             IDX64=cs_plan["idx64"],
             num_warps=1,
             num_stages=2,
@@ -905,7 +852,6 @@ def _colstrip_impl(inp, plan, is_all, cs_plan):
             out_flat,
             M,
             bands,
-            IS_ALL=is_all,
             BLOCK_M=merge_bm,
             BLOCK_S=merge_bs,
             num_warps=2,
@@ -1663,7 +1609,7 @@ def boolean_dims_impl(inp, reduce_dims, keepdim, is_all, merge_strategy="partial
             return _segcol_impl(inp, plan, is_all, seg_plan)
 
     # Route: narrow-M deep-K column-strip streaming (see
-    # _generate_colstrip_kernel_source) — contiguous fp32-class inputs whose
+    # _boolean_colstrip_kernel) — contiguous fp32-class inputs whose
     # reduce band spans every dim but the fastest and whose column count is
     # too narrow for the segcol kernel's 512-wide tiles.
     if _COLSTRIP_ENABLED and merge_strategy == "partial":
